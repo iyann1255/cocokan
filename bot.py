@@ -2,17 +2,25 @@ import os
 import re
 import hashlib
 import random
+import secrets
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any, List
 
 from dotenv import load_dotenv
-from telegram import Update, User
-from telegram.constants import ParseMode
+from telegram import (
+    Update,
+    User,
+    BotCommand,
+    MessageEntity,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -23,27 +31,34 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise SystemExit("ENV BOT_TOKEN belum diisi (BOT_TOKEN).")
 
-# Seed default dari env, bisa dioverride runtime via /setsecret
 SEED_SECRET = os.getenv("SEED_SECRET", "match-secret").strip()
+
+EMOJI_PREMIUM = {
+    "love": os.getenv("EMOJI_PREMIUM_LOVE", "").strip(),
+    "sparkle": os.getenv("EMOJI_PREMIUM_SPARKLE", "").strip(),
+    "kiss": os.getenv("EMOJI_PREMIUM_KISS", "").strip(),
+    "laugh": os.getenv("EMOJI_PREMIUM_LAUGH", "").strip(),
+    "blush": os.getenv("EMOJI_PREMIUM_BLUSH", "").strip(),
+}
 
 MENTION_RE = re.compile(r"@([A-Za-z0-9_]{4,32})")
 
 
-# ---------- Utilities ----------
+# ---------------- Utilities ----------------
 
 def _clean(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"\s+", " ", s)
     return s[:64]
 
+def _pair_key(a: str, b: str) -> Tuple[str, str]:
+    a, b = a.strip().lower(), b.strip().lower()
+    return (a, b) if a <= b else (b, a)
+
 def _stable_int(secret: str, *parts: str) -> int:
     raw = "|".join([p.strip().lower() for p in parts if p is not None]) + "|" + (secret or "")
     h = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return int(h[:16], 16)
-
-def _pair_key(a: str, b: str) -> Tuple[str, str]:
-    a, b = a.strip().lower(), b.strip().lower()
-    return (a, b) if a <= b else (b, a)
 
 def _pick(rng: random.Random, items: list, k: int = 1) -> list:
     if not items:
@@ -59,12 +74,78 @@ def _clamp(n: int, lo: int, hi: int) -> int:
 
 def _display_name(u: User) -> str:
     name = (u.full_name or u.first_name or "Seseorang").strip()
-    name = name.replace("<", "").replace(">", "")
-    return name
+    return name.replace("\n", " ")[:64]
 
-def _mention_html(u: User) -> str:
-    name = _display_name(u)
-    return f"<a href='tg://user?id={u.id}'>{name}</a>"
+def _extract_two_names(text: str) -> Optional[Tuple[str, str]]:
+    if not text:
+        return None
+    t = text.strip()
+    t = re.sub(r"^/\w+(@\w+)?\s*", "", t).strip()
+
+    seps = [" x ", " X ", " vs ", " VS ", " & ", " dan ", " + "]
+    for sep in seps:
+        if sep in t:
+            left, right = t.split(sep, 1)
+            left, right = _clean(left), _clean(right)
+            if left and right:
+                return left, right
+
+    m = MENTION_RE.findall(t)
+    if len(m) >= 2:
+        return m[0], m[1]
+    return None
+
+async def _resolve_target_user(update: Update) -> Optional[User]:
+    msg = update.effective_message
+    if not msg:
+        return None
+
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        return msg.reply_to_message.from_user
+
+    if msg.entities:
+        for ent in msg.entities:
+            if ent.type == "text_mention" and ent.user:
+                return ent.user
+
+    return None
+
+
+# ---------------- Premium Emoji Helper ----------------
+
+def pick_premium_by_score(score: int) -> Tuple[str, str]:
+    """
+    Return (key, fallback_unicode)
+    Lucu untuk rendah, romantis untuk tinggi.
+    """
+    if score >= 85:
+        return "love", "❤️‍🔥"
+    if score >= 70:
+        return "sparkle", "✨"
+    if score >= 55:
+        return "blush", "😊"
+    return "laugh", "😂"
+
+def with_premium_prefix(prefix_text: str, emoji_key: str, fallback: str) -> Tuple[str, Optional[List[MessageEntity]]]:
+    """
+    Adds a single custom emoji after prefix_text, with fallback unicode.
+    Returns (full_text, entities or None)
+    """
+    emoji_id = (EMOJI_PREMIUM.get(emoji_key) or "").strip()
+    if not emoji_id:
+        return prefix_text + fallback, None
+
+    # Custom emoji entity must point to the fallback char location.
+    # Keep it exactly 1 emoji character appended; entity length should be 2.
+    offset = len(prefix_text)
+    full_text = prefix_text + fallback
+    entities = [
+        MessageEntity(type="custom_emoji", offset=offset, length=2, custom_emoji_id=emoji_id)
+    ]
+    return full_text, entities
+
+
+# ---------------- Match Engine ----------------
 
 @dataclass
 class MatchResult:
@@ -75,12 +156,12 @@ class MatchResult:
     greens: list
     reds: list
 
-def compute_match(secret: str, name1: str, name2: str) -> MatchResult:
+def compute_match(secret: str, name1: str, name2: str, nonce: int = 0) -> MatchResult:
     n1 = _clean(name1)
     n2 = _clean(name2)
     a, b = _pair_key(n1, n2)
 
-    seed = _stable_int(secret, a, b)
+    seed = _stable_int(secret, a, b, str(int(nonce)))
     rng = random.Random(seed)
 
     base = rng.randint(35, 92)
@@ -113,46 +194,31 @@ def compute_match(secret: str, name1: str, name2: str) -> MatchResult:
 
     if score >= 90:
         label = "Soulmate Mode"
-        vibe = "Kalian tuh kalau chat, universe ikut ngetik."
+        vibe = "Kalian kalau chat, universe ikut ngetik."
     elif score >= 75:
         label = "Green Flag Couple"
-        vibe = "Nyambungnya enak, drama minim kalau komunikasi jalan."
+        vibe = "Nyambungnya enak, asal komunikasi jalan."
     elif score >= 60:
-        label = "Potential, tapi perlu usaha"
-        vibe = "Ada chemistry, tapi jangan males ngobrolin ekspektasi."
+        label = "Potential (butuh effort)"
+        vibe = "Chemistry ada, tinggal konsistenin usaha."
     elif score >= 45:
         label = "50:50"
-        vibe = "Bisa jadi, bisa bubar. Tergantung kalian—bukan ramalan."
+        vibe = "Bisa jadi, bisa bubar. Jangan mager komunikasi."
     else:
         label = "Hati-hati"
-        vibe = "Bukan nggak bisa, cuma rawan salah paham dan capek sendiri."
+        vibe = "Bukan nggak bisa, cuma rawan salah paham."
 
     reason_pool = [
         "cara mikir kalian komplementer, bukan tabrakan",
-        "satu lebih spontan, satu lebih rapi—kalau saling ngerti jadi kuat",
-        "kalian sama-sama bisa jadi tempat pulang (kalau ego nggak menang)",
+        "satu spontan, satu rapi—kalau saling ngerti jadi kuat",
         "chemistry ada, tinggal konsistenin effort",
         "ritme komunikasi cocok: nggak kebanyakan, nggak kelamaan ngilang",
-        "humor kalian sefrekuensi (yang penting jangan saling roasting kebablasan)",
-        "dua-duanya perlu clear soal batasan biar aman",
-        "kalau ngambek, jangan silent treatment—ini titik rawan kalian",
+        "humor kalian sefrekuensi (asal roastingnya nggak keterlaluan)",
+        "perlu clear soal batasan biar aman",
+        "kalau ngambek, jangan silent treatment—ini titik rawan",
     ]
-    green_pool = [
-        "supportive",
-        "jujur (kalau berani)",
-        "cepat baikan",
-        "saling ngingetin tanpa ngegas",
-        "nyaman jadi diri sendiri",
-        "bisa teamwork",
-    ]
-    red_pool = [
-        "overthinking",
-        "gengsi minta maaf",
-        "suka asumsi",
-        "posesif kalau insecure",
-        "baperan pas capek",
-        "komunikasi putus-nyambung",
-    ]
+    green_pool = ["supportive", "cepat baikan", "nyaman jadi diri sendiri", "bisa teamwork", "careful tapi tulus", "bikin tenang"]
+    red_pool = ["overthinking", "gengsi minta maaf", "suka asumsi", "baper pas capek", "komunikasi putus-nyambung", "mendadak ngilang"]
 
     reasons = _pick(rng, reason_pool, 3 if score >= 70 else 2)
     greens = _pick(rng, green_pool, 3 if score >= 75 else 2)
@@ -160,118 +226,102 @@ def compute_match(secret: str, name1: str, name2: str) -> MatchResult:
 
     return MatchResult(score=score, label=label, vibe=vibe, reasons=reasons, greens=greens, reds=reds)
 
-async def _resolve_target_user(update: Update) -> Optional[User]:
-    msg = update.effective_message
-    if not msg:
-        return None
 
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        return msg.reply_to_message.from_user
+def _meter(score: int) -> str:
+    bar_len = 10
+    filled = round((score / 100) * bar_len)
+    return "█" * filled + "░" * (bar_len - filled)
 
-    if msg.entities:
-        for ent in msg.entities:
-            if ent.type == "text_mention" and ent.user:
-                return ent.user
-
-    return None
-
-def _extract_two_names(text: str) -> Optional[Tuple[str, str]]:
-    if not text:
-        return None
-    t = text.strip()
-    t = re.sub(r"^/\w+(@\w+)?\s*", "", t).strip()
-
-    seps = [" x ", " X ", " vs ", " VS ", " & ", " dan ", " + "]
-    for sep in seps:
-        if sep in t:
-            left, right = t.split(sep, 1)
-            left, right = _clean(left), _clean(right)
-            if left and right:
-                return left, right
-
-    m = MENTION_RE.findall(t)
-    if len(m) >= 2:
-        return m[0], m[1]
-
-    return None
-
-def _format_result(title1: str, title2: str, r: MatchResult) -> str:
+def build_result_text(name1: str, name2: str, r: MatchResult) -> str:
+    reasons = "\n".join([f"• {x}" for x in r.reasons])
     greens = ", ".join(r.greens)
     reds = ", ".join(r.reds)
-    reasons = "\n".join([f"• {x}" for x in r.reasons])
-
-    bar_len = 10
-    filled = round((r.score / 100) * bar_len)
-    meter = "█" * filled + "░" * (bar_len - filled)
 
     return (
-        f"<b>💘 Love Match</b>\n"
-        f"{title1} <b>×</b> {title2}\n\n"
-        f"<b>Skor:</b> <code>{r.score}%</code>  {meter}\n"
-        f"<b>Status:</b> {r.label}\n"
-        f"<i>{r.vibe}</i>\n\n"
-        f"<b>Kenapa bisa gitu?</b>\n{reasons}\n\n"
-        f"<b>Green flags:</b> {greens}\n"
-        f"<b>Red flags:</b> {reds}\n"
-    )
-
-def _help_text() -> str:
-    return (
-        "<b>Perintah Bot Kecocokan Cinta</b>\n\n"
-        "• <code>/match</code> — reply orangnya, terus /match\n"
-        "• <code>/match @username</code> — match kamu vs username\n"
-        "• <code>/ship Asep x Iyann</code> — match dua nama\n"
-        "• <code>/compat Asep & Iyann</code> — sama kayak /ship\n"
-        "• <code>/cmds</code> — list singkat\n"
-        "• <code>/ping</code> — cek bot hidup\n"
-        "• <code>/about</code> — info bot\n"
-        "• <code>/setsecret teks</code> — ganti “versi hasil” (opsional)\n\n"
-        "Catatan: ini hiburan. Jangan dipakai buat sidang skripsi."
+        f"Love Match\n"
+        f"{name1} × {name2}\n\n"
+        f"Skor: {r.score}%  {_meter(r.score)}\n"
+        f"Status: {r.label}\n"
+        f"Vibe: {r.vibe}\n\n"
+        f"Kenapa:\n{reasons}\n\n"
+        f"Green flags: {greens}\n"
+        f"Red flags: {reds}\n"
     )
 
 
-# ---------- Commands ----------
+# ---------------- Reroll Sessions ----------------
+
+def _get_sessions(app: Application) -> Dict[str, Dict[str, Any]]:
+    return app.bot_data.setdefault("reroll_sessions", {})
+
+def _make_reroll_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Coba lagi 💞", callback_data=f"reroll:{token}")]])
+
+
+# ---------------- Command Text ----------------
+
+def help_text() -> str:
+    return (
+        "Perintah Bot Kecocokan Cinta\n\n"
+        "• /match  (reply orangnya) atau /match @username\n"
+        "• /ship Nama1 x Nama2\n"
+        "• /compat Nama1 & Nama2\n"
+        "• /ping\n"
+        "• /about\n"
+        "• /setsecret kata_rahasia\n\n"
+        "Tips: reply pesan orangnya terus /match biar paling enak."
+    )
+
+
+# ---------------- Handlers ----------------
+
+async def _post_init(app: Application) -> None:
+    commands = [
+        BotCommand("start", "Mulai & cara pakai"),
+        BotCommand("help", "Panduan lengkap"),
+        BotCommand("cmds", "List perintah singkat"),
+        BotCommand("match", "Cocokin kamu vs orang (reply/@user)"),
+        BotCommand("ship", "Cocokin dua nama (A x B)"),
+        BotCommand("compat", "Alias /ship"),
+        BotCommand("ping", "Cek bot hidup"),
+        BotCommand("about", "Info bot"),
+        BotCommand("setsecret", "Ubah secret hasil (opsional)"),
+    ]
+    await app.bot.set_my_commands(commands)
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(_help_text(), parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(help_text())
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(_help_text(), parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(help_text())
 
 async def cmds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "<b>Commands</b>\n"
-        "• /match (reply) | /match @user\n"
-        "• /ship A x B | /compat A & B\n"
-        "• /ping | /about | /help\n"
+    await update.effective_message.reply_text(
+        "Commands:\n"
+        "/match (reply) | /match @user\n"
+        "/ship A x B | /compat A & B\n"
+        "/ping | /about | /help | /setsecret"
     )
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("pong")
 
 async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "<b>About</b>\n"
-        "Bot kecocokan cinta deterministik (hasil stabil untuk pasangan yang sama).\n"
-        "Kamu bisa ubah “versi hasil” pakai /setsecret."
+    await update.effective_message.reply_text(
+        "About:\n"
+        "Bot kecocokan cinta (hiburan) + tombol reroll.\n"
+        "Kalau mau emoji premium, isi EMOJI_PREMIUM_* di .env."
     )
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 async def setsecret_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global SEED_SECRET
     msg = update.effective_message
-    if not msg:
-        return
-
-    arg = (context.args[0] if context.args else "").strip()
+    arg = " ".join(context.args).strip() if context.args else ""
     if not arg:
-        await msg.reply_text("Pakai: <code>/setsecret kata_rahasia</code>", parse_mode=ParseMode.HTML)
+        await msg.reply_text("Pakai: /setsecret kata_rahasia")
         return
-
-    # Simpen hanya di memory runtime (restart bot = balik ke env)
     SEED_SECRET = _clean(arg)
-    await msg.reply_text(f"OK. Secret diganti jadi: <code>{SEED_SECRET}</code>", parse_mode=ParseMode.HTML)
+    await msg.reply_text(f"OK. Secret diganti jadi: {SEED_SECRET}\nCatatan: kalau bot restart, secret balik ke .env.")
 
 async def match_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -280,34 +330,39 @@ async def match_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     target = await _resolve_target_user(update)
-
     typed = msg.text or ""
     m = MENTION_RE.search(typed)
     typed_username = m.group(1) if m else None
 
     if target is None and not typed_username:
-        await msg.reply_text(
-            "Cara pakenya:\n"
-            "• reply orangnya lalu <code>/match</code>\n"
-            "• atau <code>/match @username</code>\n"
-            "• atau <code>/ship Nama1 x Nama2</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        await msg.reply_text("Cara pakai:\n1) reply orangnya lalu /match\n2) atau /match @username\n3) atau /ship A x B")
         return
 
     name1 = _display_name(me)
-    title1 = _mention_html(me)
 
     if target:
         name2 = _display_name(target)
-        title2 = _mention_html(target)
     else:
-        name2 = typed_username
-        safe = typed_username.replace("<", "").replace(">", "")
-        title2 = f"@{safe}"
+        name2 = f"@{typed_username}"
 
-    r = compute_match(SEED_SECRET, name1, name2)
-    await msg.reply_text(_format_result(title1, title2, r), parse_mode=ParseMode.HTML)
+    token = secrets.token_urlsafe(8)
+    sessions = _get_sessions(context.application)
+    sessions[token] = {"name1": name1, "name2": name2, "nonce": 0}
+
+    r = compute_match(SEED_SECRET, name1, name2, nonce=0)
+
+    # Premium emoji prefix (lucu/romantis) + fallback
+    key, fallback = pick_premium_by_score(r.score)
+    prefix, entities = with_premium_prefix("💘 ", key, fallback)
+
+    text = prefix + "\n" + build_result_text(name1, name2, r)
+
+    await msg.reply_text(
+        text,
+        entities=entities,
+        reply_markup=_make_reroll_keyboard(token),
+        disable_web_page_preview=True,
+    )
 
 async def ship_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -316,36 +371,84 @@ async def ship_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     pair = _extract_two_names(msg.text or "")
     if not pair:
-        await msg.reply_text(
-            "Format:\n"
-            "• <code>/ship Asep x Iyann</code>\n"
-            "• <code>/compat Asep & Iyann</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        await msg.reply_text("Format:\n/ship Nama1 x Nama2\n/compat Nama1 & Nama2")
         return
 
     a, b = pair
-    r = compute_match(SEED_SECRET, a, b)
-    title1 = a.replace("<", "").replace(">", "")
-    title2 = b.replace("<", "").replace(">", "")
-    await msg.reply_text(_format_result(title1, title2, r), parse_mode=ParseMode.HTML)
+
+    token = secrets.token_urlsafe(8)
+    sessions = _get_sessions(context.application)
+    sessions[token] = {"name1": a, "name2": b, "nonce": 0}
+
+    r = compute_match(SEED_SECRET, a, b, nonce=0)
+
+    key, fallback = pick_premium_by_score(r.score)
+    prefix, entities = with_premium_prefix("💘 ", key, fallback)
+
+    text = prefix + "\n" + build_result_text(a, b, r)
+
+    await msg.reply_text(
+        text,
+        entities=entities,
+        reply_markup=_make_reroll_keyboard(token),
+        disable_web_page_preview=True,
+    )
 
 async def compat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await ship_cmd(update, context)
 
+async def reroll_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q or not q.data:
+        return
+    await q.answer()
+
+    m = re.match(r"^reroll:(.+)$", q.data)
+    if not m:
+        return
+    token = m.group(1)
+
+    sessions = _get_sessions(context.application)
+    sess = sessions.get(token)
+    if not sess:
+        await q.edit_message_text("Session expired. Ketik /match atau /ship lagi ya.")
+        return
+
+    sess["nonce"] = int(sess.get("nonce", 0)) + 1
+    name1 = sess["name1"]
+    name2 = sess["name2"]
+
+    r = compute_match(SEED_SECRET, name1, name2, nonce=sess["nonce"])
+
+    key, fallback = pick_premium_by_score(r.score)
+    prefix, entities = with_premium_prefix("💘 ", key, fallback)
+
+    text = prefix + "\n" + build_result_text(name1, name2, r)
+
+    await q.edit_message_text(
+        text,
+        entities=entities,
+        reply_markup=_make_reroll_keyboard(token),
+        disable_web_page_preview=True,
+    )
+
 async def text_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Hint kecil biar user nemu command (nggak sering spam)
     msg = update.effective_message
     if not msg or not msg.text:
         return
     t = msg.text.lower()
-    if "kecocokan" in t or "cocok" in t or "ship" in t:
-        if update.effective_chat and update.effective_chat.type in ("group", "supergroup"):
-            if random.random() < 0.06:
-                await msg.reply_text("Coba /match (reply orangnya) atau /ship Nama1 x Nama2.")
+    if update.effective_chat and update.effective_chat.type in ("group", "supergroup"):
+        if ("cocok" in t or "kecocokan" in t or "jodoh" in t) and random.random() < 0.05:
+            await msg.reply_text("Coba /match (reply orangnya) atau /ship Nama1 x Nama2")
+
+
+# ---------------- Main ----------------
 
 def main() -> None:
-    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+    app: Application = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
+    # commands
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("cmds", cmds_cmd))
@@ -357,6 +460,10 @@ def main() -> None:
     app.add_handler(CommandHandler("ship", ship_cmd))
     app.add_handler(CommandHandler("compat", compat_cmd))
 
+    # inline button
+    app.add_handler(CallbackQueryHandler(reroll_cb, pattern=r"^reroll:"))
+
+    # hints
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_hint))
 
     print("LoveMatch bot running...")
