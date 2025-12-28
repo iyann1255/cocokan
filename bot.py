@@ -460,6 +460,34 @@ async def text_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if ("cocok" in t or "kecocokan" in t or "jodoh" in t) and random.random() < 0.05:
             await msg.reply_text("Coba /match (reply orangnya) atau /ship Nama1 x Nama2")
 
+async def testemoji_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lines = []
+    entities: List[MessageEntity] = []
+
+    # kita bikin string ASCII panjang biar offset gampang (tanpa emoji unicode)
+    # format: "* love\n* sparkle\n..."
+    text = ""
+    offset = 0
+
+    for key in ["love", "sparkle", "kiss", "laugh", "blush"]:
+        emoji_id = (EMOJI_PREMIUM.get(key) or "").strip()
+        # tiap baris diawali placeholder "*"
+        line = f"* {key} -> {emoji_id or 'EMPTY'}\n"
+        text += line
+
+        if emoji_id:
+            entities.append(
+                MessageEntity(
+                    type="custom_emoji",
+                    offset=offset,   # posisi '*' di awal baris ini
+                    length=1,        # placeholder 1 char
+                    custom_emoji_id=str(emoji_id),
+                )
+            )
+        offset += len(line)
+
+    await update.effective_message.reply_text(text, entities=entities)
+
 # =========================
 # MAIN
 # =========================
@@ -476,6 +504,8 @@ def main() -> None:
     app.add_handler(CommandHandler("match", match_cmd))
     app.add_handler(CommandHandler("ship", ship_cmd))
     app.add_handler(CommandHandler("compat", compat_cmd))
+    app.add_handler(CommandHandler("testemoji", testemoji_cmd))
+
 
     # Inline button
     app.add_handler(CallbackQueryHandler(reroll_cb, pattern=r"^reroll:"))
