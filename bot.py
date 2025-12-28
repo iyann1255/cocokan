@@ -49,7 +49,7 @@ def _pick(rng: random.Random, items: list, k: int = 1) -> list:
     if not items:
         return []
     if k <= 1:
-        return [items[rng.randrange(0, len(items)))]
+        return [items[rng.randrange(0, len(items))]]
     items2 = items[:]
     rng.shuffle(items2)
     return items2[:k]
