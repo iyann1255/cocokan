@@ -1,8 +1,12 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import re
 import hashlib
 import random
 import secrets
+import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any, List
 
@@ -25,7 +29,15 @@ from telegram.ext import (
     filters,
 )
 
+# =========================
+# CONFIG
+# =========================
 load_dotenv()
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("love-match")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -33,6 +45,7 @@ if not BOT_TOKEN:
 
 SEED_SECRET = os.getenv("SEED_SECRET", "match-secret").strip()
 
+# Isi pakai custom_emoji_id (angka), contoh: 5260535596941582167
 EMOJI_PREMIUM = {
     "love": os.getenv("EMOJI_PREMIUM_LOVE", "").strip(),
     "sparkle": os.getenv("EMOJI_PREMIUM_SPARKLE", "").strip(),
@@ -41,11 +54,16 @@ EMOJI_PREMIUM = {
     "blush": os.getenv("EMOJI_PREMIUM_BLUSH", "").strip(),
 }
 
+# Normalize: custom_emoji_id harus string
+for k, v in list(EMOJI_PREMIUM.items()):
+    if v:
+        EMOJI_PREMIUM[k] = str(v)
+
 MENTION_RE = re.compile(r"@([A-Za-z0-9_]{4,32})")
 
-
-# ---------------- Utilities ----------------
-
+# =========================
+# UTIL
+# =========================
 def _clean(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"\s+", " ", s)
@@ -110,13 +128,14 @@ async def _resolve_target_user(update: Update) -> Optional[User]:
 
     return None
 
-
-# ---------------- Premium Emoji Helper ----------------
-
+# =========================
+# PREMIUM EMOJI (SAFE)
+# =========================
 def pick_premium_by_score(score: int) -> Tuple[str, str]:
     """
     Return (key, fallback_unicode)
     Lucu untuk rendah, romantis untuk tinggi.
+    NOTE: fallback boleh multi-codepoint, karena hanya dipakai saat tanpa entity.
     """
     if score >= 85:
         return "love", "❤️‍🔥"
@@ -126,27 +145,31 @@ def pick_premium_by_score(score: int) -> Tuple[str, str]:
         return "blush", "😊"
     return "laugh", "😂"
 
-def with_premium_prefix(prefix_text: str, emoji_key: str, fallback: str) -> Tuple[str, Optional[List[MessageEntity]]]:
+def with_premium_prefix(prefix_label: str, emoji_key: str, fallback: str) -> Tuple[str, Optional[List[MessageEntity]]]:
     """
-    Adds a single custom emoji after prefix_text, with fallback unicode.
-    Returns (full_text, entities or None)
+    FIX BadRequest UTF-16:
+    - gunakan placeholder ASCII 1 char di awal ("*")
+    - entity custom_emoji menimpa placeholder tsb: offset=0 length=1
+    - kalau emoji_id kosong -> fallback unicode biasa
     """
     emoji_id = (EMOJI_PREMIUM.get(emoji_key) or "").strip()
     if not emoji_id:
-        return prefix_text + fallback, None
+        return f"{fallback} {prefix_label}", None
 
-    # Custom emoji entity must point to the fallback char location.
-    # Keep it exactly 1 emoji character appended; entity length should be 2.
-    offset = len(prefix_text)
-    full_text = prefix_text + fallback
+    text = f"* {prefix_label}"
     entities = [
-        MessageEntity(type="custom_emoji", offset=offset, length=2, custom_emoji_id=emoji_id)
+        MessageEntity(
+            type="custom_emoji",
+            offset=0,
+            length=1,  # placeholder 1 char ASCII => aman
+            custom_emoji_id=emoji_id,
+        )
     ]
-    return full_text, entities
+    return text, entities
 
-
-# ---------------- Match Engine ----------------
-
+# =========================
+# MATCH ENGINE
+# =========================
 @dataclass
 class MatchResult:
     score: int
@@ -226,7 +249,6 @@ def compute_match(secret: str, name1: str, name2: str, nonce: int = 0) -> MatchR
 
     return MatchResult(score=score, label=label, vibe=vibe, reasons=reasons, greens=greens, reds=reds)
 
-
 def _meter(score: int) -> str:
     bar_len = 10
     filled = round((score / 100) * bar_len)
@@ -238,7 +260,6 @@ def build_result_text(name1: str, name2: str, r: MatchResult) -> str:
     reds = ", ".join(r.reds)
 
     return (
-        f"Love Match\n"
         f"{name1} × {name2}\n\n"
         f"Skor: {r.score}%  {_meter(r.score)}\n"
         f"Status: {r.label}\n"
@@ -248,18 +269,18 @@ def build_result_text(name1: str, name2: str, r: MatchResult) -> str:
         f"Red flags: {reds}\n"
     )
 
-
-# ---------------- Reroll Sessions ----------------
-
+# =========================
+# REROLL SESSIONS
+# =========================
 def _get_sessions(app: Application) -> Dict[str, Dict[str, Any]]:
     return app.bot_data.setdefault("reroll_sessions", {})
 
 def _make_reroll_keyboard(token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("Coba lagi 💞", callback_data=f"reroll:{token}")]])
 
-
-# ---------------- Command Text ----------------
-
+# =========================
+# HELP TEXT
+# =========================
 def help_text() -> str:
     return (
         "Perintah Bot Kecocokan Cinta\n\n"
@@ -272,9 +293,9 @@ def help_text() -> str:
         "Tips: reply pesan orangnya terus /match biar paling enak."
     )
 
-
-# ---------------- Handlers ----------------
-
+# =========================
+# HANDLERS
+# =========================
 async def _post_init(app: Application) -> None:
     commands = [
         BotCommand("start", "Mulai & cara pakai"),
@@ -288,6 +309,9 @@ async def _post_init(app: Application) -> None:
         BotCommand("setsecret", "Ubah secret hasil (opsional)"),
     ]
     await app.bot.set_my_commands(commands)
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("Unhandled exception", exc_info=context.error)
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(help_text())
@@ -310,7 +334,7 @@ async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "About:\n"
         "Bot kecocokan cinta (hiburan) + tombol reroll.\n"
-        "Kalau mau emoji premium, isi EMOJI_PREMIUM_* di .env."
+        "Emoji premium aktif kalau EMOJI_PREMIUM_* diisi di .env."
     )
 
 async def setsecret_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -339,11 +363,7 @@ async def match_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     name1 = _display_name(me)
-
-    if target:
-        name2 = _display_name(target)
-    else:
-        name2 = f"@{typed_username}"
+    name2 = _display_name(target) if target else f"@{typed_username}"
 
     token = secrets.token_urlsafe(8)
     sessions = _get_sessions(context.application)
@@ -351,11 +371,10 @@ async def match_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     r = compute_match(SEED_SECRET, name1, name2, nonce=0)
 
-    # Premium emoji prefix (lucu/romantis) + fallback
     key, fallback = pick_premium_by_score(r.score)
-    prefix, entities = with_premium_prefix("💘 ", key, fallback)
+    prefix, entities = with_premium_prefix("Love Match", key, fallback)
 
-    text = prefix + "\n" + build_result_text(name1, name2, r)
+    text = prefix + "\n\n" + build_result_text(name1, name2, r)
 
     await msg.reply_text(
         text,
@@ -383,9 +402,9 @@ async def ship_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     r = compute_match(SEED_SECRET, a, b, nonce=0)
 
     key, fallback = pick_premium_by_score(r.score)
-    prefix, entities = with_premium_prefix("💘 ", key, fallback)
+    prefix, entities = with_premium_prefix("Love Match", key, fallback)
 
-    text = prefix + "\n" + build_result_text(a, b, r)
+    text = prefix + "\n\n" + build_result_text(a, b, r)
 
     await msg.reply_text(
         text,
@@ -421,9 +440,9 @@ async def reroll_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     r = compute_match(SEED_SECRET, name1, name2, nonce=sess["nonce"])
 
     key, fallback = pick_premium_by_score(r.score)
-    prefix, entities = with_premium_prefix("💘 ", key, fallback)
+    prefix, entities = with_premium_prefix("Love Match", key, fallback)
 
-    text = prefix + "\n" + build_result_text(name1, name2, r)
+    text = prefix + "\n\n" + build_result_text(name1, name2, r)
 
     await q.edit_message_text(
         text,
@@ -433,7 +452,6 @@ async def reroll_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def text_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Hint kecil biar user nemu command (nggak sering spam)
     msg = update.effective_message
     if not msg or not msg.text:
         return
@@ -442,31 +460,33 @@ async def text_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if ("cocok" in t or "kecocokan" in t or "jodoh" in t) and random.random() < 0.05:
             await msg.reply_text("Coba /match (reply orangnya) atau /ship Nama1 x Nama2")
 
-
-# ---------------- Main ----------------
-
+# =========================
+# MAIN
+# =========================
 def main() -> None:
     app: Application = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
-    # commands
+    # Commands
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("cmds", cmds_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("about", about_cmd))
     app.add_handler(CommandHandler("setsecret", setsecret_cmd))
-
     app.add_handler(CommandHandler("match", match_cmd))
     app.add_handler(CommandHandler("ship", ship_cmd))
     app.add_handler(CommandHandler("compat", compat_cmd))
 
-    # inline button
+    # Inline button
     app.add_handler(CallbackQueryHandler(reroll_cb, pattern=r"^reroll:"))
 
-    # hints
+    # Hints
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_hint))
 
-    print("LoveMatch bot running...")
+    # Error handler
+    app.add_error_handler(on_error)
+
+    log.info("LoveMatch bot running...")
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
